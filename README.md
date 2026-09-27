@@ -83,6 +83,30 @@ The **View: 2D/3D** button in the top-right of the side panel switches the board
 - **Direct dependency:** `pygame-ce` (from `requirements.txt`), a community-maintained, API-compatible fork of `pygame`.
 - Keep it updated periodically (`pip install --upgrade pygame-ce`) and watch its release notes for fixes.
 
+## Troubleshooting
+
+**`can't open file '...\main.py': [Errno 2] No such file or directory`**
+Your terminal isn't in the project folder. `cd` into it first, then run the game:
+
+```bash
+cd path\to\chess-game
+python main.py
+```
+
+**`ModuleNotFoundError: No module named 'pygame'`**
+You're running a Python interpreter that doesn't have the dependency installed — usually because the virtual environment isn't activated (or doesn't exist yet). Fix:
+
+```bash
+cd path\to\chess-game
+python -m venv .venv          # only if .venv doesn't exist yet
+.venv\Scripts\activate         # Windows
+pip install -r requirements.txt
+python main.py
+```
+
+**No prebuilt `pygame`/`pygame-ce` wheel for your Python version**
+If `pip install -r requirements.txt` tries to build from source and fails, your Python version is too new for a prebuilt wheel yet. Either install a slightly older Python (3.11/3.12 are well-supported), or install the latest `pygame-ce` directly (`pip install --upgrade pygame-ce`), which tends to add new-version wheels faster than upstream `pygame`.
+
 ## Known Limitations
 
 - The AI has no quiescence search or transposition table, so tactical strength is limited even at "Hard."
