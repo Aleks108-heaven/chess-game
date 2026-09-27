@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Compile check
+        run: python -m py_compile main.py chess_engine.py chess_ai.py
+
+      - name: Headless smoke test (renders board in 2D and 3D)
+        env:
+          SDL_VIDEODRIVER: dummy
+          SDL_AUDIODRIVER: dummy
+        run: |
+          python -c "
+          import main
+
+          game = main.ChessUI()
+          game.show_menu = False
+
+          # 2D view
+          game._draw_game_state()
+
+          # 3D perspective view
+          game.view_3d = True
+          game._draw_game_state()
+
+          # Menu screen
+          game.show_menu = True
+          game._draw_menu('main', (0, 0))
+
+          # Make sure a full legal move actually applies end to end
+          moves = game.engine.get_valid_moves()
+          assert moves, 'no legal moves generated from the starting position'
+          game._execute_move(moves[0], animate=False)
+          assert len(game.engine.move_log) == 1, 'move was not recorded'
+
+          print('Smoke test passed')
+          "

@@ -1,5 +1,7 @@
 # ♔ Chess Game ♚
 
+[![CI](https://github.com/Aleks108-heaven/chess-game/actions/workflows/ci.yml/badge.svg)](https://github.com/Aleks108-heaven/chess-game/actions/workflows/ci.yml)
+
 A Python chess game with a graphical interface built using Pygame. Play against an AI opponent or challenge a friend in 2-player mode, with a wood-themed board that can switch between a flat 2D view and a tilted pseudo-3D perspective view.
 
 ## Features
