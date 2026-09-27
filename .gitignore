@@ -1,0 +1,16 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Windows / OneDrive artifacts
+desktop.ini
+Thumbs.db
+
+# Editor/tooling
+.gitignor/
