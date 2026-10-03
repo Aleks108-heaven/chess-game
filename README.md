@@ -47,11 +47,16 @@ python main.py
 
 ## Controls
 
-| Key   | Action         |
-| ----- | -------------- |
-| `Z`   | Undo move      |
-| `R`   | New game       |
-| `ESC` | Return to menu |
+| Key                         | Action                                                       |
+| --------------------------- | ------------------------------------------------------------ |
+| `Z`                         | Undo move (disabled while the AI is thinking)                |
+| `R`                         | New game (asks to confirm if a game is in progress)          |
+| `V`                         | Toggle 2D / 3D view                                          |
+| `ESC`                       | Open menu (in the menu: go back, or resume the current game) |
+| `Up` / `Down` / `Tab`       | Move focus in menus                                          |
+| `Enter` / `Space`           | Activate the focused menu button                             |
+| `Q` `R` `B` `N`             | Choose a promotion piece                                     |
+| Mouse wheel / `PgUp` `PgDn` | Scroll the move history                                      |
 
 The **View: 2D/3D** button in the top-right of the side panel switches the board view at any time during a game.
 
@@ -111,6 +116,8 @@ If `pip install -r requirements.txt` tries to build from source and fails, your 
 
 - The AI has no quiescence search or transposition table, so tactical strength is limited even at "Hard."
 - 3D view uses click-to-move only (no drag-and-drop) and skips move animation.
+- Pieces are Unicode glyphs rendered from a system font (Segoe UI Symbol, Apple Symbols, DejaVu Sans, etc.), so their look varies by OS; there is no bundled piece set yet.
+- The board itself is mouse-only (menus, dialogs and promotion are keyboard-accessible).
 - No save/load, network play, or PGN/FEN import-export yet.
 
 ## Security Notes
