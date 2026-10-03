@@ -50,7 +50,7 @@ jobs:
 
           # Menu screen
           game.show_menu = True
-          game._draw_menu('main', (0, 0))
+          game._draw_menu((0, 0))
 
           # Make sure a full legal move actually applies end to end
           moves = game.engine.get_valid_moves()
