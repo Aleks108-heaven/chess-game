@@ -4,6 +4,20 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.0] - 2026-10-16
+
+No gameplay changes: this release adds a Windows installer.
+
+### Added
+- **Windows setup installer** (`ChessGame-v1.1.0-windows-x64-setup.exe`, built with Inno Setup
+  from `installer/ChessGame.iss`). Installs per user without an administrator prompt (the wizard
+  can install for all users instead), adds Start Menu and optional desktop shortcuts, appears in
+  *Apps > Installed apps* and uninstalls cleanly. Installing a newer version over an older one
+  upgrades it in place. The portable zip is still published.
+- `tools/build_release.py` builds the installer, then installs it silently into a temporary
+  folder, runs the installed program's `--self-test` and uninstalls it before the release is
+  accepted. `--no-installer` builds the zip only.
+
 ## [1.0.0] - 2026-10-16
 
 First tagged release.
@@ -46,4 +60,5 @@ First tagged release.
   `pygame.quit()`.
 - Menu title and subtitle no longer collide.
 
+[1.1.0]: https://github.com/Aleks108-heaven/chess-game/releases/tag/v1.1.0
 [1.0.0]: https://github.com/Aleks108-heaven/chess-game/releases/tag/v1.0.0

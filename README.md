@@ -6,7 +6,12 @@ A Python chess game with a graphical interface built using Pygame. Play against 
 
 ## Download
 
-Windows users can grab the standalone app (no Python needed) from the [Releases page](https://github.com/Aleks108-heaven/chess-game/releases): unzip and run `ChessGame.exe`. The build is **not code-signed**, so Windows may show a SmartScreen or application-control warning; verify the download against `SHA256SUMS.txt` from the release.
+Windows users can grab the standalone app (no Python needed) from the [Releases page](https://github.com/Aleks108-heaven/chess-game/releases):
+
+- **Installer:** run `ChessGame-v<version>-windows-x64-setup.exe`. It installs for your user account (no administrator prompt), adds a Start Menu entry and can be removed from *Apps > Installed apps*.
+- **Portable:** unzip `ChessGame-v<version>-windows-x64.zip` and run `ChessGame.exe`.
+
+The builds are **not code-signed**, so Windows may show a SmartScreen or application-control warning; verify the download against `SHA256SUMS.txt` from the release.
 
 ## Features
 
@@ -120,10 +125,10 @@ The suite covers the move generator (published perft counts, FEN, castling/en pa
 
 ```bash
 pip install -r requirements-build.txt
-python tools/build_release.py        # tests, PyInstaller build, self-test of the built app, zip, SHA-256
+python tools/build_release.py        # tests, PyInstaller build, self-test, zip, setup installer, SHA-256
 ```
 
-Output lands in `dist/`. The build refuses to produce an artifact unless the test suite passes and the packaged program passes its own `--self-test`. The version comes from `version.py`; add an entry to `CHANGELOG.md` for each release.
+Output lands in `dist/`. The build refuses to produce an artifact unless the test suite passes and the packaged program passes its own `--self-test`; the installer is then installed into a temporary folder, self-tested and uninstalled. The installer needs [Inno Setup 6](https://jrsoftware.org/isinfo.php) (`winget install JRSoftware.InnoSetup`); pass `--no-installer` to build the zip only. The version comes from `version.py`; add an entry to `CHANGELOG.md` for each release.
 
 ## Project Structure
 
@@ -140,6 +145,7 @@ Output lands in `dist/`. The build refuses to produce an artifact unless the tes
 │   └── book.py          #   opening book
 ├── tests/               # pytest suite
 ├── tools/               # ladder_match.py, build_release.py, make_icon.py
+├── installer/           # Inno Setup script for the Windows installer
 ├── assets/icon.ico      # executable icon (rendered by tools/make_icon.py)
 ├── version.py           # release version
 ├── requirements*.txt    # runtime / dev / build dependencies (pinned)
