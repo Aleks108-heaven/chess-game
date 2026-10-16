@@ -7,6 +7,11 @@ env/
 __pycache__/
 *.pyc
 *.pyo
+.pytest_cache/
+
+# Build output (see tools/build_release.py)
+build/
+dist/
 
 # Windows / OneDrive artifacts
 desktop.ini
