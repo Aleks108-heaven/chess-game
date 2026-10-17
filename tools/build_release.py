@@ -16,7 +16,9 @@ program can start, draw every screen and play a move against the computer (``--s
 The installer is then installed silently into a temporary folder, the installed program is
 self-tested, and it is uninstalled again.
 
-The installer needs Inno Setup 6 (``winget install JRSoftware.InnoSetup``).
+The installer needs Inno Setup 6 (``winget install JRSoftware.InnoSetup``). It installs for all
+users into Program Files, which needs administrator approval, so the smoke test above installs
+with ``/CURRENTUSER`` into a temporary folder instead of elevating.
 """
 
 from __future__ import annotations
@@ -51,7 +53,8 @@ Chess Game {version}
 Run {exe} (no installation, no Python needed).
 
 * Play vs the computer at five levels, Junior to Senior, or against a friend.
-* Keys: Z undo, R new game, V 2D/3D view, F flip board, M mute, Esc menu.
+* Keys: Z undo, R new game, V 2D/3D view, F flip board, M mute, D offer a draw, C claim a draw,
+  X resign, P copy the game as PGN, H show the rules, Esc menu.
 
 Windows may show a "Windows protected your PC" (SmartScreen) or an application-control
 warning the first time: this build is not code-signed. To check the download, compare the

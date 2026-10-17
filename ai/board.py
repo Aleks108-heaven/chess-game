@@ -230,9 +230,10 @@ class SearchBoard:
     def from_engine(cls, engine) -> "SearchBoard":
         """Snapshot a ChessEngine, including enough history to see repetitions.
 
-        The move log is replayed from the standard start so the position keys line up with
-        the game; if the replay does not reproduce the engine's board (it always should) the
-        position is taken from the engine's state alone, with no repetition history.
+        The move log is replayed from the position the game started in (the standard one, or
+        the engine's ``initial_fen`` when it was set up from a FEN) so the position keys line
+        up with the game; if the replay does not reproduce the engine's board (it always
+        should) the position is taken from the engine's state alone, with no repetition history.
         """
         replayed = cls._replay(engine)
         if replayed is not None:
@@ -254,11 +255,11 @@ class SearchBoard:
 
     @classmethod
     def _replay(cls, engine) -> Optional["SearchBoard"]:
-        board = cls.start()
         try:
+            board = cls.from_fen(getattr(engine, "initial_fen", START_FEN))
             for move in engine.move_log:
                 board.make(board.move_from_engine(move))
-        except (KeyError, IndexError, ValueError):
+        except (KeyError, IndexError, ValueError):  # InvalidPositionError is a ValueError
             return None
         for row in range(8):
             for col in range(8):
@@ -721,8 +722,23 @@ class SearchBoard:
         return False
 
     def is_insufficient_material(self) -> bool:
-        """Bare kings, or kings plus one minor piece: no side can force mate."""
-        return self.pawn_key == 0 and self.phase <= 1
+        """Checkmate is impossible (chess-rules.md, I-04): bare kings, kings plus one minor
+        piece, or kings and bishops that all stand on squares of one colour."""
+        if self.pawn_key:
+            return False
+        if self.phase <= 1:
+            return True
+        if self.phase != self.bishops[0] + self.bishops[1]:
+            return False  # a knight, rook or queen is on the board
+        colour = -1
+        for s in range(64):
+            if self.sq[s] & 7 == BISHOP:
+                square_colour = ((s >> 3) + (s & 7)) & 1
+                if colour == -1:
+                    colour = square_colour
+                elif colour != square_colour:
+                    return False
+        return True
 
     def has_non_pawn_material(self, color: int) -> bool:
         b = self.sq

@@ -17,8 +17,10 @@ import threading
 import traceback
 from functools import lru_cache
 import theme
-from chess_engine import ChessEngine, Move
+from chess_engine import (RESULT_BLACK_WINS, RESULT_ONGOING, RESULT_WHITE_WINS,
+                          ChessEngine, IllegalActionError, Move)
 from chess_ai import ChessAI, DEFAULT_LEVEL_KEY, LEVELS, get_level
+from rules_text import RULES_PAGES
 from version import __version__
 
 # Fonts known to ship the chess glyphs (U+2654..U+265F), tried in order. SDL_ttf does not
@@ -59,13 +61,26 @@ class ChessUI:
     SQUARE_SIZE = BOARD_WIDTH // DIMENSION
     MAX_FPS = 60
     FRAME_THICKNESS = 6
-    FOOTER_HEIGHT = 84   # the shortcut legend at the bottom of the side panel
+    FOOTER_HEIGHT = 146  # the shortcut legend at the bottom of the side panel (6 rows)
+    ACTIONS_HEIGHT = 52  # the Offer draw / Claim draw / Resign buttons above the legend
 
-    # Pseudo-3D perspective board
-    PERSPECTIVE_TOP_RATIO = 0.86  # far edge width as a fraction of the near edge
+    # Pseudo-3D perspective board: a trapezoid set inside a wooden frame, on a table
+    PERSPECTIVE_TOP_RATIO = 0.92  # far edge width as a fraction of the near edge
     PERSPECTIVE_GAMMA = 1.15      # >1 compresses far rows for a depth illusion
     PIECE_SCALE_FAR = 0.62
     PIECE_SCALE_NEAR = 1.0
+    FRAME_3D_SIDE, FRAME_3D_TOP, FRAME_3D_BOTTOM = 18, 12, 24  # px from the window edge to the board
+    FRAME_3D_EDGE = 2             # the frame stops this far short of the window edge
+
+    # Draw offers and claims
+    TOAST_MS = 3500               # how long a short notice stays on screen
+
+    # The Rules screen (rules_text.py): a panel over the whole window
+    RULES_PANEL_SIZE = (780, 572)
+    RULES_MARGIN = 32             # text inset from the panel edge
+    RULES_PARAGRAPH_GAP = 8
+    RULES_BULLET_INDENT = 20
+    RULES_BUTTON_WIDTH = 150
 
     # Colors - Wood theme. Values live in theme.py, where tests check their WCAG contrast.
     LIGHT_SQUARE = pygame.Color(*theme.BOARD_LIGHT)
@@ -200,7 +215,10 @@ class ChessUI:
         self.menu_focus = 0
 
         # Modal / transient UI state
-        self.confirm_new_game = False
+        self.dialog = None                # 'new_game', 'resign' or 'draw_offer' while one is open
+        self.rules_page = None            # index into RULES_PAGES while the Rules screen is open
+        self.toast = None                 # (text, expires_at_tick): a short notice over the board
+        self._claim_hints_shown = set()   # draws we have already told the player they can claim
         self.move_scroll = 0              # pairs scrolled back from the latest move
         self.game_over_sound_at = None    # tick at which to play the game-over sound
 
@@ -211,10 +229,14 @@ class ChessUI:
         self.view_3d = False
         self.view_toggle_rect = pygame.Rect(
             self.BOARD_WIDTH + self.MOVE_LOG_WIDTH - 106, 8, 96, 28)
-        self._persp_top_left = (self.BOARD_WIDTH * (1 - self.PERSPECTIVE_TOP_RATIO) / 2, 0)
-        self._persp_top_right = (self.BOARD_WIDTH * (1 + self.PERSPECTIVE_TOP_RATIO) / 2, 0)
-        self._persp_bottom_left = (0, self.BOARD_HEIGHT)
-        self._persp_bottom_right = (self.BOARD_WIDTH, self.BOARD_HEIGHT)
+        near_left, near_right = self.FRAME_3D_SIDE, self.BOARD_WIDTH - self.FRAME_3D_SIDE
+        far_y, near_y = self.FRAME_3D_TOP, self.BOARD_HEIGHT - self.FRAME_3D_BOTTOM
+        far_inset = (near_right - near_left) * (1 - self.PERSPECTIVE_TOP_RATIO) / 2
+        self._persp_top_left = (near_left + far_inset, far_y)
+        self._persp_top_right = (near_right - far_inset, far_y)
+        self._persp_bottom_left = (near_left, near_y)
+        self._persp_bottom_right = (near_right, near_y)
+        self._scaled_sprites = {}         # (piece, size) -> scaled image, for the 3D view
 
         # UI state
         self.selected_square = None
@@ -538,9 +560,10 @@ class ChessUI:
     def _board_coords_3d(self, pos: tuple) -> tuple:
         """Inverse-map a screen position to (row, col) under the perspective transform."""
         mx, my = pos
-        if my < 0 or my >= self.BOARD_HEIGHT:
+        far_y, near_y = self._persp_top_left[1], self._persp_bottom_left[1]
+        if my < far_y or my >= near_y:
             return (-1, -1)
-        v_screen = my / self.BOARD_HEIGHT
+        v_screen = (my - far_y) / (near_y - far_y)
         v_raw = v_screen ** (1 / self.PERSPECTIVE_GAMMA)
         visual_row = min(7, int(v_raw * 8))
 
@@ -564,7 +587,7 @@ class ChessUI:
             return self._cached_board_surface_3d
 
         surf = pygame.Surface((self.BOARD_WIDTH, self.BOARD_HEIGHT))
-        surf.fill((20, 12, 7))
+        self._draw_table(surf)
         self._fill_perspective_frame(surf)
 
         for visual_row in range(self.DIMENSION):
@@ -585,37 +608,93 @@ class ChessUI:
                 pygame.draw.polygon(surf, (0, 0, 0), [tl, tr, br, bl], 1)
 
         self._stroke_perspective_frame(surf)
+        self._draw_coords_3d(surf)
         self._cached_board_surface_3d = surf
         self._cached_board_flipped_3d = self.flip_board
         return surf
 
-    def _fill_perspective_frame(self, surf: pygame.Surface) -> None:
-        """Fill the wooden wedge outside the board trapezoid, before squares are drawn
-        on top -- so this only ever shows through in the sliver outside the board."""
-        dark = self.WOOD_DARK
-        outer = [
-            (max(0, self._persp_top_left[0] - 10), 0),
-            (min(self.BOARD_WIDTH - 1, self._persp_top_right[0] + 10), 0),
-            (min(self.BOARD_WIDTH - 1, self._persp_bottom_right[0]), self.BOARD_HEIGHT - 1),
-            (max(0, self._persp_bottom_left[0]), self.BOARD_HEIGHT - 1),
+    def _draw_table(self, surf: pygame.Surface) -> None:
+        """The dark wooden table the framed board stands on. It fills the wedges either side
+        of the tilted board, so no part of the window is left as an empty black gap."""
+        top, bottom = theme.TABLE_TOP, theme.TABLE_BOTTOM
+        for y in range(self.BOARD_HEIGHT):
+            t = y / max(1, self.BOARD_HEIGHT - 1)
+            color = tuple(int(top[i] + (bottom[i] - top[i]) * t) for i in range(3))
+            pygame.draw.line(surf, color, (0, y), (self.BOARD_WIDTH, y))
+        rng = random.Random(7)  # fixed seed: the grain is the same every time
+        grain = pygame.Surface((self.BOARD_WIDTH, self.BOARD_HEIGHT), pygame.SRCALPHA)
+        for _ in range(60):
+            y = rng.randint(0, self.BOARD_HEIGHT)
+            shade = rng.randint(-14, 10)
+            tone = (max(0, min(255, bottom[0] + shade)), max(0, min(255, bottom[1] + shade)),
+                    max(0, min(255, bottom[2] + shade)), 50)
+            pygame.draw.line(grain, tone, (0, y), (self.BOARD_WIDTH, y + rng.randint(-6, 6)),
+                             rng.randint(1, 2))
+        surf.blit(grain, (0, 0))
+
+    def _frame_outline(self) -> list:
+        """The outer edge of the wooden frame: the board trapezoid pushed outwards by the frame
+        width, so its sides keep the same slant as the board's."""
+        far_y, near_y = self._persp_top_left[1], self._persp_bottom_left[1]
+        outer_far_y = far_y - (self.FRAME_3D_TOP - self.FRAME_3D_EDGE)
+        outer_near_y = near_y + (self.FRAME_3D_BOTTOM - self.FRAME_3D_EDGE)
+        push = self.FRAME_3D_SIDE - self.FRAME_3D_EDGE
+
+        def side_x(y: float, far_x: float, near_x: float) -> float:
+            return self._lerp(far_x, near_x, (y - far_y) / (near_y - far_y))
+
+        left_far, left_near = self._persp_top_left[0], self._persp_bottom_left[0]
+        right_far, right_near = self._persp_top_right[0], self._persp_bottom_right[0]
+        return [
+            (side_x(outer_far_y, left_far, left_near) - push, outer_far_y),
+            (side_x(outer_far_y, right_far, right_near) + push, outer_far_y),
+            (side_x(outer_near_y, right_far, right_near) + push, outer_near_y),
+            (side_x(outer_near_y, left_far, left_near) - push, outer_near_y),
         ]
-        pygame.draw.polygon(surf, dark, outer)
+
+    def _fill_perspective_frame(self, surf: pygame.Surface) -> None:
+        """Fill the wooden frame (before the squares are drawn on top of its middle)."""
+        outer = self._frame_outline()
+        pygame.draw.polygon(surf, self.WOOD_MID, outer)
+        # A darker band at the near edge reads as the front face of the frame's thickness.
+        near = [outer[3], outer[2], (outer[2][0] - 3, outer[2][1] - 6), (outer[3][0] + 3, outer[3][1] - 6)]
+        pygame.draw.polygon(surf, self.WOOD_DARK, near)
 
     def _stroke_perspective_frame(self, surf: pygame.Surface) -> None:
         """Draw the frame's bevel accents as outlines on top of the finished board,
         so they never blot out the squares underneath."""
-        dark = self.WOOD_DARK
-        light = self.WOOD_LIGHT
-        outer = [
-            (max(0, self._persp_top_left[0] - 10), 0),
-            (min(self.BOARD_WIDTH - 1, self._persp_top_right[0] + 10), 0),
-            (min(self.BOARD_WIDTH - 1, self._persp_bottom_right[0]), self.BOARD_HEIGHT - 1),
-            (max(0, self._persp_bottom_left[0]), self.BOARD_HEIGHT - 1),
-        ]
+        dark, light = self.WOOD_DARK, self.WOOD_LIGHT
+        outer = self._frame_outline()
         inner = [self._persp_top_left, self._persp_top_right,
                  self._persp_bottom_right, self._persp_bottom_left]
-        pygame.draw.polygon(surf, light, outer, 3)
-        pygame.draw.polygon(surf, dark, inner, 2)
+        # Raised frame: lit along the top and left edges, shaded along the bottom and right.
+        pygame.draw.line(surf, light, outer[3], outer[0], 3)
+        pygame.draw.line(surf, light, outer[0], outer[1], 3)
+        pygame.draw.line(surf, dark, outer[1], outer[2], 3)
+        pygame.draw.line(surf, dark, outer[2], outer[3], 3)
+        pygame.draw.polygon(surf, dark, inner, 2)   # the groove between frame and squares
+
+    def _rank_label(self, visual_row: int) -> str:
+        return str(visual_row + 1) if self.flip_board else str(8 - visual_row)
+
+    def _file_label(self, visual_col: int) -> str:
+        return chr(ord('h') - visual_col) if self.flip_board else chr(ord('a') + visual_col)
+
+    def _draw_coords_3d(self, surf: pygame.Surface) -> None:
+        """Rank numbers down the left of the frame and file letters along the front, as in 2D."""
+        for visual_row in range(self.DIMENSION):
+            tl, _, _, bl = self._persp_quad(visual_row, 0)
+            center = ((tl[0] + bl[0]) / 2 - self.FRAME_3D_SIDE / 2 + 1, (tl[1] + bl[1]) / 2)
+            self._draw_centered_coord(surf, self._rank_label(visual_row), center)
+        for visual_col in range(self.DIMENSION):
+            _, _, br, bl = self._persp_quad(self.DIMENSION - 1, visual_col)
+            center = ((bl[0] + br[0]) / 2, bl[1] + self.FRAME_3D_BOTTOM / 2 - 1)
+            self._draw_centered_coord(surf, self._file_label(visual_col), center)
+
+    def _draw_centered_coord(self, surf: pygame.Surface, label: str, center: tuple) -> None:
+        width, height = self.coord_font.size(label)
+        self._draw_outlined_coord(surf, label, (round(center[0] - width / 2),
+                                                round(center[1] - height / 2)))
 
     def _get_board_surface(self) -> pygame.Surface:
         """Get or create the cached board background (squares + coordinates)."""
@@ -718,8 +797,8 @@ class ChessUI:
         """Create the fixed buttons (the confirm dialog). Menu rects come from _menu_layout."""
         board_cx = self.BOARD_WIDTH // 2
         self.buttons = {
-            'confirm_yes': pygame.Rect(board_cx - 110, 330, 100, 44),
-            'confirm_no': pygame.Rect(board_cx + 10, 330, 100, 44),
+            'confirm_yes': pygame.Rect(board_cx - 180, 330, 170, 44),
+            'confirm_no': pygame.Rect(board_cx + 10, 330, 170, 44),
         }
 
     def _menu_layout(self) -> dict:
@@ -772,10 +851,14 @@ class ChessUI:
                     running = False
 
                 elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                    if self.confirm_new_game:
-                        self._handle_confirm_click(mouse_pos)
+                    if self.rules_page is not None:
+                        self._handle_rules_click(mouse_pos)
+                    elif self.dialog:
+                        self._handle_dialog_click(mouse_pos)
                     elif not self.show_menu and self.view_toggle_rect.collidepoint(mouse_pos):
                         self._toggle_view()
+                    elif not self.show_menu and self._handle_action_click(mouse_pos):
+                        pass  # one of the Offer draw / Claim draw / Resign buttons
                     elif self.show_menu:
                         self._handle_menu_click(mouse_pos)
                     elif self.promotion_pending:
@@ -787,7 +870,7 @@ class ChessUI:
                 elif event.type == pygame.MOUSEMOTION:
                     if self.dragging:
                         self.drag_pos = event.pos
-                    if self.show_menu:
+                    if self.show_menu and self.rules_page is None:
                         hovered = self._menu_index_at(event.pos)
                         if hovered is not None:
                             self.menu_focus = hovered
@@ -820,15 +903,7 @@ class ChessUI:
                     except Exception:
                         pass
 
-            # Process AI result (held back while the menu is open, and for a short minimum
-            # "thinking" time so an instant reply is still readable)
-            move = None
-            with self.ai_lock:
-                if (self.ai_move is not None and not self.show_menu
-                        and pygame.time.get_ticks() - self.ai_started_at >= self.AI_MIN_THINK_MS):
-                    move = self.ai_move
-                    self.ai_move = None
-
+            move = self._take_ready_ai_move()
             if move is not None:
                 # The AI chooses its own promotion piece (see ChessAI.choose_move).
                 self._execute_move(move, animate=True)
@@ -845,8 +920,11 @@ class ChessUI:
                     self._draw_game_over_message()
                 elif self.ai_thinking:
                     self._draw_thinking_indicator()
-            if self.confirm_new_game:
-                self._draw_confirm_dialog(mouse_pos)
+            if self.dialog:
+                self._draw_dialog(mouse_pos)
+            self._draw_toast()
+            if self.rules_page is not None:
+                self._draw_rules(mouse_pos)
 
             pygame.display.flip()
             self.clock.tick(self.MAX_FPS)
@@ -868,13 +946,17 @@ class ChessUI:
         self._reset_selection()
 
     def _handle_key(self, key: int) -> None:
-        """Route a key press to the active layer: confirm dialog > menu > promotion > game."""
-        if self.confirm_new_game:
-            if key in (pygame.K_y, pygame.K_RETURN, pygame.K_KP_ENTER):
-                self.confirm_new_game = False
-                self._reset_game()
-            elif key in (pygame.K_n, pygame.K_ESCAPE):
-                self.confirm_new_game = False
+        """Route a key press to the active layer: rules > dialog > menu > promotion > game."""
+        if self.rules_page is not None:
+            self._handle_rules_key(key)
+            return
+
+        if self.dialog:
+            # Enter takes the focused button, which is always the safe choice (No / Decline).
+            if key == pygame.K_y:
+                self._answer_dialog(True)
+            elif key in (pygame.K_n, pygame.K_ESCAPE, pygame.K_RETURN, pygame.K_KP_ENTER):
+                self._answer_dialog(False)
             return
 
         if self.show_menu:
@@ -900,6 +982,16 @@ class ChessUI:
             self._flip_board()
         elif key == pygame.K_m:
             self.muted = not self.muted
+        elif key == pygame.K_d:
+            self._use_action('offer_draw')
+        elif key == pygame.K_c:
+            self._use_action('claim_draw')
+        elif key == pygame.K_x:
+            self._use_action('resign')
+        elif key == pygame.K_p:
+            self._copy_pgn()
+        elif key in (pygame.K_h, pygame.K_F1):
+            self._open_rules()
         elif key == pygame.K_ESCAPE:
             self.show_menu = True
             self.menu_state = 'main'
@@ -912,16 +1004,296 @@ class ChessUI:
     def _request_new_game(self) -> None:
         """Start over immediately if nothing is at stake, otherwise ask first."""
         if self.engine.move_log and not self.game_over:
-            self.confirm_new_game = True
+            self.dialog = 'new_game'
         else:
             self._reset_game()
 
-    def _handle_confirm_click(self, pos: tuple) -> None:
+    # --- Dialogs, draw offers, claims and resignation (J-12, A-03, A-05, A-08) ---
+
+    def _handle_dialog_click(self, pos: tuple) -> None:
         if self.buttons['confirm_yes'].collidepoint(pos):
-            self.confirm_new_game = False
-            self._reset_game()
+            self._answer_dialog(True)
         elif self.buttons['confirm_no'].collidepoint(pos):
-            self.confirm_new_game = False
+            self._answer_dialog(False)
+
+    def _answer_dialog(self, yes: bool) -> None:
+        """Close the open dialog; ``yes`` is the confirming button."""
+        kind, self.dialog = self.dialog, None
+        if kind == 'new_game':
+            if yes:
+                self._reset_game()
+        elif kind == 'resign':
+            if yes:
+                self._resign()
+        elif kind == 'draw_offer':
+            if yes:
+                self.engine.accept_draw()
+                self._finish_game()
+            else:
+                self.engine.decline_draw()
+                self._notify("Draw offer declined")
+
+    def _side_name(self, color: str) -> str:
+        return "White" if color == 'w' else "Black"
+
+    def _acting_color(self) -> str:
+        """Who offers, claims or resigns from the panel: you against the computer, otherwise
+        the side to move."""
+        if self.vs_ai:
+            return self.player_color
+        return 'w' if self.engine.white_to_move else 'b'
+
+    def _actions_open(self) -> bool:
+        """The panel's game actions can be used (no menu, dialog or promotion in the way)."""
+        return (not self.show_menu and self.dialog is None and self.promotion_pending is None
+                and not self.game_over and not self.animating)
+
+    def _action_state(self, action: str) -> tuple:
+        """(enabled, why not) for 'offer_draw', 'claim_draw' or 'resign'."""
+        if self.game_over:
+            return False, "The game is over."
+        if not self._actions_open():
+            return False, ""
+        if action == 'resign':
+            return True, ""
+        if not self._is_player_turn():
+            return False, "Wait for your turn."
+        if action == 'claim_draw':
+            if self.engine.can_claim_draw():
+                return True, ""
+            return False, "No draw to claim yet (3x repetition, or 50 moves with no capture or pawn move)."
+        color = self._acting_color()
+        if self.engine.can_offer_draw(color):
+            return True, ""
+        wait = self.engine.moves_until_draw_offer(color)
+        return False, (f"You can offer another draw after {wait} more move{'s' if wait != 1 else ''}."
+                       if wait else "A draw cannot be offered now.")
+
+    def _use_action(self, action: str) -> None:
+        """Carry out a panel action, or say why it is not available right now."""
+        enabled, reason = self._action_state(action)
+        if not enabled:
+            if reason:
+                self._notify(reason)
+            return
+        if action == 'resign':
+            self.dialog = 'resign'
+        elif action == 'offer_draw':
+            self._offer_draw()
+        else:
+            self._claim_draw()
+
+    def _action_rects(self) -> dict:
+        gap = 6
+        width = (self.MOVE_LOG_WIDTH - 30 - 2 * gap) // 3
+        left = self.BOARD_WIDTH + 15
+        top = self.BOARD_HEIGHT - self.FOOTER_HEIGHT - self.ACTIONS_HEIGHT + (self.ACTIONS_HEIGHT - theme.MIN_TARGET) // 2
+        return {action: pygame.Rect(left + i * (width + gap), top, width, theme.MIN_TARGET)
+                for i, action in enumerate(('offer_draw', 'claim_draw', 'resign'))}
+
+    def _handle_action_click(self, pos: tuple) -> bool:
+        for action, rect in self._action_rects().items():
+            if rect.collidepoint(pos):
+                self._use_action(action)
+                return True
+        return False
+
+    def _offer_draw(self) -> None:
+        color = self._acting_color()
+        self.engine.offer_draw(color)
+        if not self.vs_ai:
+            self.dialog = 'draw_offer'   # the other player answers
+            return
+        if self.ai.accepts_draw(self.engine, ai_is_white=(color == 'b')):
+            self.engine.accept_draw()
+            self._finish_game()
+        else:
+            self.engine.decline_draw()
+            self._notify(f"{get_level(self.level_key).name} declines the draw.")
+
+    def _claim_draw(self) -> None:
+        try:
+            self.engine.claim_draw()
+        except IllegalActionError:
+            return
+        self._finish_game()
+
+    def _resign(self) -> None:
+        self._discard_ai_search()
+        try:
+            self.engine.resign(self._acting_color())
+        except IllegalActionError:
+            return
+        self._finish_game()
+
+    def _finish_game(self) -> None:
+        """The engine has ended the game by resignation, agreement or a claim."""
+        self.game_over = self.engine.result != RESULT_ONGOING
+        self._reset_selection()
+        self.promotion_pending = None
+        if self.game_over:
+            self.game_over_sound_at = pygame.time.get_ticks() + 200
+
+    def _announce_claim(self) -> None:
+        """Tell the player once when a draw becomes claimable on their turn."""
+        reason = self.engine.can_claim_draw()
+        if (reason and self._is_player_turn() and reason not in self._claim_hints_shown):
+            self._claim_hints_shown.add(reason)
+            self._notify(f"You can claim a draw ({reason}): press C or click Claim draw.")
+
+    def _copy_pgn(self) -> None:
+        """Put the game so far on the clipboard as PGN, for pasting into an analysis site."""
+        if not self.engine.move_log:
+            self._notify("Nothing to copy yet: make a move first.")
+            return
+        if self.vs_ai:
+            computer = f"{get_level(self.level_key).name} (computer)"
+            white, black = ("You", computer) if self.player_color == 'w' else (computer, "You")
+        else:
+            white, black = "White", "Black"
+        try:
+            pgn = self.engine.to_pgn(white=white, black=black)
+            pygame.scrap.put_text(pgn)
+        except (pygame.error, AttributeError, NotImplementedError, ValueError, RuntimeError):
+            self._notify("Could not copy: the clipboard is not available.")
+            return
+        self._notify("Game copied to the clipboard (PGN).")
+
+    def _notify(self, text: str) -> None:
+        """Show a short notice over the board."""
+        self.toast = (text, pygame.time.get_ticks() + self.TOAST_MS)
+
+    # --- The Rules screen (rules_text.py) ---
+
+    def _open_rules(self, page: int = 0) -> None:
+        """Show the rules over whatever is on screen (the menu or the game)."""
+        self.rules_page = max(0, min(len(RULES_PAGES) - 1, page))
+        self._reset_selection()
+
+    def _close_rules(self) -> None:
+        self.rules_page = None
+
+    def _turn_rules_page(self, step: int) -> None:
+        self.rules_page = max(0, min(len(RULES_PAGES) - 1, self.rules_page + step))
+
+    def _handle_rules_key(self, key: int) -> None:
+        if key in (pygame.K_RIGHT, pygame.K_PAGEDOWN, pygame.K_SPACE, pygame.K_DOWN):
+            self._turn_rules_page(+1)
+        elif key in (pygame.K_LEFT, pygame.K_PAGEUP, pygame.K_BACKSPACE, pygame.K_UP):
+            self._turn_rules_page(-1)
+        elif key == pygame.K_HOME:
+            self.rules_page = 0
+        elif key == pygame.K_END:
+            self.rules_page = len(RULES_PAGES) - 1
+        elif key in (pygame.K_ESCAPE, pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_h, pygame.K_F1):
+            self._close_rules()
+
+    def _rules_panel_rect(self) -> pygame.Rect:
+        panel = pygame.Rect((0, 0), self.RULES_PANEL_SIZE)
+        panel.center = ((self.BOARD_WIDTH + self.MOVE_LOG_WIDTH) // 2, self.BOARD_HEIGHT // 2)
+        return panel
+
+    def _rules_button_rects(self) -> dict:
+        """Previous / Next / Close along the bottom of the panel."""
+        panel = self._rules_panel_rect()
+        top = panel.bottom - self.RULES_MARGIN // 2 - theme.MIN_TARGET - 8
+        width, gap = self.RULES_BUTTON_WIDTH, theme.SPACE_3
+        left = panel.x + self.RULES_MARGIN
+        return {
+            'prev': pygame.Rect(left, top, width, theme.MIN_TARGET),
+            'next': pygame.Rect(left + width + gap, top, width, theme.MIN_TARGET),
+            'close': pygame.Rect(panel.right - self.RULES_MARGIN - width, top, width, theme.MIN_TARGET),
+        }
+
+    def _rules_text_area(self) -> pygame.Rect:
+        """Where a page's paragraphs go: under the title, above the buttons."""
+        panel = self._rules_panel_rect()
+        top = panel.y + 76
+        bottom = self._rules_button_rects()['prev'].top - theme.SPACE_3
+        return pygame.Rect(panel.x + self.RULES_MARGIN, top,
+                           panel.width - 2 * self.RULES_MARGIN, bottom - top)
+
+    @staticmethod
+    def _wrap_text(font: pygame.font.Font, text: str, max_width: int) -> list:
+        """Break text into lines no wider than max_width (a single over-long word stays whole)."""
+        lines, line = [], ""
+        for word in text.split():
+            candidate = f"{line} {word}" if line else word
+            if line and font.size(candidate)[0] > max_width:
+                lines.append(line)
+                line = word
+            else:
+                line = candidate
+        if line:
+            lines.append(line)
+        return lines
+
+    def _rules_layout(self, page: int) -> tuple:
+        """([(x, y, text)], height) for a page, positions relative to the text area. A bullet
+        paragraph gets a bullet mark and a hanging indent."""
+        font = self.status_font
+        area = self._rules_text_area()
+        line_height = font.get_linesize()
+        placed, y = [], 0
+        for paragraph in RULES_PAGES[page][1]:
+            bullet = paragraph.startswith("- ")
+            indent = self.RULES_BULLET_INDENT if bullet else 0
+            if bullet:
+                placed.append((self.RULES_BULLET_INDENT // 3, y, "•"))
+            for line in self._wrap_text(font, paragraph[2:] if bullet else paragraph,
+                                        area.width - indent):
+                placed.append((indent, y, line))
+                y += line_height
+            y += self.RULES_PARAGRAPH_GAP
+        return placed, max(0, y - self.RULES_PARAGRAPH_GAP)
+
+    def _handle_rules_click(self, pos: tuple) -> None:
+        rects = self._rules_button_rects()
+        if rects['prev'].collidepoint(pos):
+            self._turn_rules_page(-1)
+        elif rects['next'].collidepoint(pos):
+            self._turn_rules_page(+1)
+        elif rects['close'].collidepoint(pos):
+            self._close_rules()
+
+    def _draw_rules(self, mouse_pos: tuple) -> None:
+        """The Rules screen: a titled, paged panel over a dimmed window."""
+        page = self.rules_page
+        overlay = pygame.Surface((self.BOARD_WIDTH + self.MOVE_LOG_WIDTH, self.BOARD_HEIGHT),
+                                 pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, theme.MENU_SCRIM_ALPHA))
+        self.screen.blit(overlay, (0, 0))
+
+        panel = self._rules_panel_rect()
+        pygame.draw.rect(self.screen, self.PANEL_BG, panel, border_radius=10)
+        pygame.draw.rect(self.screen, self.WOOD_LIGHT, panel, 2, border_radius=10)
+
+        title = self.title_font.render(RULES_PAGES[page][0], True, self.PANEL_LATEST)
+        self.screen.blit(title, (panel.x + self.RULES_MARGIN, panel.y + 22))
+        counter = self.status_font.render(f"{page + 1} / {len(RULES_PAGES)}", True, self.PANEL_DIM)
+        self.screen.blit(counter, counter.get_rect(right=panel.right - self.RULES_MARGIN,
+                                                   centery=panel.y + 22 + title.get_height() // 2))
+        pygame.draw.line(self.screen, self.PANEL_DIVIDER, (panel.x + self.RULES_MARGIN, panel.y + 62),
+                         (panel.right - self.RULES_MARGIN, panel.y + 62))
+
+        area = self._rules_text_area()
+        for dx, dy, text in self._rules_layout(page)[0]:
+            self.screen.blit(self.status_font.render(text, True, self.PANEL_TEXT),
+                             (area.x + dx, area.y + dy))
+
+        rects = self._rules_button_rects()
+        for name, label, enabled in (('prev', "< Previous", page > 0),
+                                     ('next', "Next >", page < len(RULES_PAGES) - 1),
+                                     ('close', "Close (Esc)", True)):
+            rect = rects[name]
+            if enabled:
+                self._draw_gradient_button(rect, label, self.toggle_font,
+                                           rect.collidepoint(mouse_pos), radius=6, shadow=False,
+                                           gloss=False,
+                                           focused=(name == 'next' or (name == 'close'
+                                                    and page == len(RULES_PAGES) - 1)))
+            else:
+                self._draw_off_button(rect, label)
 
     def _can_resume(self) -> bool:
         """A game is on the board that the menu was opened over."""
@@ -929,7 +1301,7 @@ class ChessUI:
 
     def _menu_options(self) -> list:
         if self.menu_state == 'main':
-            return (['resume'] if self._can_resume() else []) + ['vs_ai', 'vs_human']
+            return (['resume'] if self._can_resume() else []) + ['vs_ai', 'vs_human', 'rules']
         if self.menu_state == 'color_select':
             return ['play_white', 'play_black', 'back']
         return [f'level_{level.key}' for level in LEVELS] + ['back']
@@ -942,6 +1314,8 @@ class ChessUI:
             self.menu_focus = (self.menu_focus - 1) % len(options)
         elif key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE):
             self._activate_menu(options[self.menu_focus])
+        elif key in (pygame.K_h, pygame.K_F1):
+            self._open_rules()
         elif key == pygame.K_ESCAPE:
             if self.menu_state != 'main':
                 self._activate_menu('back')
@@ -950,6 +1324,9 @@ class ChessUI:
 
     def _activate_menu(self, button_id: str) -> None:
         """Apply a menu choice (shared by mouse and keyboard)."""
+        if button_id == 'rules':
+            self._open_rules()   # a screen over the menu: the cursor stays where it was
+            return
         self.menu_focus = 0
         if button_id == 'resume':
             self.show_menu = False
@@ -1059,22 +1436,17 @@ class ChessUI:
                                 if m.start_row == end_row and m.start_col == end_col]
             return
 
-        # Find matching valid move
-        candidate = Move(start_row, start_col, end_row, end_col,
-                         self.engine.get_piece_at(start_row, start_col),
-                         self.engine.get_piece_at(end_row, end_col))
-
-        for valid_move in self.all_valid_moves:
-            if candidate == valid_move:
-                if valid_move.is_pawn_promotion:
-                    # Show promotion dialog
-                    self.promotion_pending = valid_move
-                    self._reset_selection()
-                else:
-                    self._execute_move(valid_move, animate=True)
-                return
-
-        self._reset_selection()
+        # A promotion is four legal moves for the same squares (I-03), so ask which piece.
+        matches = [m for m in self.all_valid_moves
+                   if (m.start_row, m.start_col, m.end_row, m.end_col)
+                   == (start_row, start_col, end_row, end_col)]
+        if not matches:
+            self._reset_selection()
+        elif matches[0].is_pawn_promotion:
+            self.promotion_pending = matches[0]   # only its squares and colour are used
+            self._reset_selection()
+        else:
+            self._execute_move(matches[0], animate=True)
 
     def _handle_promotion_click(self, pos: tuple) -> None:
         """Handle click on promotion dialog."""
@@ -1088,9 +1460,12 @@ class ChessUI:
         self.promotion_pending = None
 
     def _choose_promotion(self, piece: str) -> None:
-        move = self.promotion_pending
-        move.promotion_piece = piece
+        pending = self.promotion_pending
         self.promotion_pending = None
+        squares = (pending.start_row, pending.start_col, pending.end_row, pending.end_col)
+        move = next(m for m in self.all_valid_moves
+                    if (m.start_row, m.start_col, m.end_row, m.end_col) == squares
+                    and m.promotion_piece == piece)
         self._execute_move(move, animate=False)
 
     def _handle_menu_click(self, pos: tuple) -> None:
@@ -1105,36 +1480,19 @@ class ChessUI:
         """Execute a move with animation and sound."""
         if animate and not self.view_3d and not self.reduced_motion:
             self._animate_move(move)
-        self.engine.make_move(move)
+        # The engine checks the move, works out check / checkmate / draws and sets the result.
+        move = self.engine.play(move)
         self._reset_selection()
         self.move_scroll = 0
         self.all_valid_moves = self.engine.get_valid_moves()
-
-        # Set check / checkmate flags on the move for notation
-        if len(self.all_valid_moves) == 0 and self.engine._is_in_check():
-            move.is_checkmate = True
-            self.engine.checkmate = True
-            self.engine.in_check = True
-            self.game_over = True
-        elif len(self.all_valid_moves) == 0:
-            self.engine.stalemate = True
-            self.game_over = True
-        else:
-            self.engine.in_check = self.engine._is_in_check()
-            if self.engine.in_check:
-                move.is_check = True
-
-        # Check for draw conditions
-        if not self.game_over:
-            draw_reason = self.engine.is_draw()
-            if draw_reason:
-                self.engine.draw_reason = draw_reason
-                self.game_over = True
+        self.game_over = self.engine.result != RESULT_ONGOING
 
         self._play_sound(move)
 
         if self.game_over:
             self.game_over_sound_at = pygame.time.get_ticks() + 200
+        else:
+            self._announce_claim()
 
     def _reset_selection(self) -> None:
         self.selected_square = None
@@ -1172,6 +1530,17 @@ class ChessUI:
 
         threading.Thread(target=think, daemon=True, name="chess-ai").start()
 
+    def _take_ready_ai_move(self):
+        """The computer's finished move, if it may be played now (else None, and the move stays
+        waiting). It is held back while the menu or the Rules screen is open, and for a short
+        minimum "thinking" time so an instant reply is still readable."""
+        with self.ai_lock:
+            if (self.ai_move is None or self.show_menu or self.rules_page is not None
+                    or pygame.time.get_ticks() - self.ai_started_at < self.AI_MIN_THINK_MS):
+                return None
+            move, self.ai_move = self.ai_move, None
+            return move
+
     def _cancel_ai(self) -> None:
         """Ask any search in flight to stop (it returns promptly; its result is discarded)."""
         if self.ai_stop is not None:
@@ -1187,24 +1556,32 @@ class ChessUI:
         if self.vs_ai and self.engine.move_log:
             self.engine.undo_move()
         self.all_valid_moves = self.engine.get_valid_moves()
-        self.game_over = False
+        # Undoing reopens a game that ended on the board; one ended by resignation or
+        # agreement before any move was made stays over.
+        self.game_over = self.engine.result != RESULT_ONGOING
         self.game_over_sound_at = None
         self.move_scroll = 0
         self._reset_selection()
 
-    def _reset_game(self) -> None:
+    def _discard_ai_search(self) -> None:
+        """Stop any search in flight and drop its result (the position it was for is gone)."""
         self._cancel_ai()
         with self.ai_lock:
             self.ai_generation += 1  # invalidates any in-flight AI search
             self.ai_move = None
+        self.ai_thinking = False
+
+    def _reset_game(self) -> None:
+        self._discard_ai_search()
         self.ai.new_game()
         self.engine.reset_game()
         self.all_valid_moves = self.engine.get_valid_moves()
         self.game_over = False
         self.game_over_sound_at = None
-        self.ai_thinking = False
         self.promotion_pending = None
-        self.confirm_new_game = False
+        self.dialog = None
+        self.toast = None
+        self._claim_hints_shown = set()
         self.move_scroll = 0
         self.show_menu = True
         self.menu_state = 'main'
@@ -1390,13 +1767,24 @@ class ChessUI:
                 scale = self.PIECE_SCALE_FAR + (self.PIECE_SCALE_NEAR - self.PIECE_SCALE_FAR) * depth_t
                 size = max(8, int(self.SQUARE_SIZE * scale))
 
-                shadow = pygame.transform.smoothscale(self._cached_piece_shadow, (size, size))
-                self.screen.blit(shadow, (anchor_x - size / 2, anchor_y - size * 0.42))
-
-                img = pygame.transform.smoothscale(self.piece_images[piece], (size, size))
-                # Never let a far, tall piece render above the board's top edge
+                # The shadow image has its ellipse near the bottom of a square-sized surface, so
+                # it goes exactly where the piece image goes (as in 2D). Drawing it a fraction of
+                # a square lower put every shadow on the square in front of its piece.
                 draw_y = max(1, anchor_y - size)
-                self.screen.blit(img, (anchor_x - size / 2, draw_y))
+                position = (anchor_x - size / 2, draw_y)
+                self.screen.blit(self._scaled_sprite(None, size), position)
+                self.screen.blit(self._scaled_sprite(piece, size), position)
+
+    def _scaled_sprite(self, piece, size: int) -> pygame.Surface:
+        """A piece image (or, for ``None``, the grounding shadow) scaled to ``size`` px, cached:
+        the 3D view needs the same few sizes every frame."""
+        key = (piece, size)
+        sprite = self._scaled_sprites.get(key)
+        if sprite is None:
+            source = self._cached_piece_shadow if piece is None else self.piece_images[piece]
+            sprite = pygame.transform.smoothscale(source, (size, size))
+            self._scaled_sprites[key] = sprite
+        return sprite
 
     def _draw_dragged_piece(self) -> None:
         """Draw the piece being dragged at cursor position."""
@@ -1422,7 +1810,7 @@ class ChessUI:
                 and self._cached_panel_move_count == move_count
                 and self._cached_panel_state == current_state):
             self.screen.blit(self._cached_panel_surface, (self.BOARD_WIDTH, 0))
-            self._draw_view_toggle_button()
+            self._draw_panel_controls()
             return
 
         panel = pygame.Surface((self.MOVE_LOG_WIDTH, self.BOARD_HEIGHT))
@@ -1501,7 +1889,7 @@ class ChessUI:
         moves = self.engine.move_log
         header_y = y
         y += 20
-        max_y = self.BOARD_HEIGHT - self.FOOTER_HEIGHT - 13
+        max_y = self.BOARD_HEIGHT - self.FOOTER_HEIGHT - self.ACTIONS_HEIGHT - 13
 
         total_pairs = (len(moves) + 1) // 2
         visible_pairs = (max_y - y) // 20
@@ -1549,7 +1937,9 @@ class ChessUI:
             sound_action = "Unmute" if self.muted else "Mute"
         shortcuts = [("Z", "Undo"), ("R", "New game"),
                      ("V", "2D / 3D"), ("F", "Flip board"),
-                     ("M", sound_action), ("Esc", "Menu")]
+                     ("D", "Offer draw"), ("C", "Claim draw"),
+                     ("X", "Resign"), ("P", "Copy PGN"),
+                     ("H", "Rules"), ("M", sound_action), ("Esc", "Menu")]
         for i, (key, action) in enumerate(shortcuts):
             text = self.log_font.render(f"[{key}] {action}", True, self.PANEL_DIM)
             panel.blit(text, (15 + (i % 2) * 135, footer_top + 10 + (i // 2) * 22))
@@ -1563,7 +1953,33 @@ class ChessUI:
         self._cached_panel_move_count = move_count
         self._cached_panel_state = current_state
         self.screen.blit(panel, (self.BOARD_WIDTH, 0))
+        self._draw_panel_controls()
+
+    def _draw_panel_controls(self) -> None:
+        """The buttons that change with the mouse or the game, drawn over the cached panel."""
         self._draw_view_toggle_button()
+        self._draw_action_buttons()
+
+    def _draw_action_buttons(self) -> None:
+        """Offer draw / Claim draw / Resign. A button that cannot be used right now is flat and
+        grey; a claimable draw is picked out with the focus ring so it is not missed."""
+        mouse = pygame.mouse.get_pos()
+        labels = {'offer_draw': "Offer draw", 'claim_draw': "Claim draw", 'resign': "Resign"}
+        for action, rect in self._action_rects().items():
+            enabled, _ = self._action_state(action)
+            if enabled:
+                self._draw_gradient_button(rect, labels[action], self.toggle_font,
+                                           rect.collidepoint(mouse), radius=6, shadow=False,
+                                           gloss=False, focused=(action == 'claim_draw'))
+            else:
+                self._draw_off_button(rect, labels[action])
+
+    def _draw_off_button(self, rect: pygame.Rect, label: str) -> None:
+        """A button that cannot be used right now: flat, grey and still readable."""
+        pygame.draw.rect(self.screen, theme.BUTTON_OFF_BG, rect, border_radius=6)
+        pygame.draw.rect(self.screen, theme.BUTTON_OFF_BORDER, rect, 1, border_radius=6)
+        text = self.toggle_font.render(label, True, theme.BUTTON_OFF_TEXT)
+        self.screen.blit(text, text.get_rect(center=rect.center))
 
     def _opponent_caption(self) -> str:
         """One line under the panel title: who the player is facing."""
@@ -1699,48 +2115,88 @@ class ChessUI:
         overlay.fill((0, 0, 0, 180))
         self.screen.blit(overlay, (0, 0))
 
-        icon = None
-        if self.engine.checkmate:
-            winner = "Black" if self.engine.white_to_move else "White"
-            icon = "\u265A" if self.engine.white_to_move else "\u2654"
-            text = f"{winner} wins by checkmate!"
-        elif self.engine.draw_reason:
-            text = f"Draw - {self.engine.draw_reason}"
-        else:
-            text = "Draw by stalemate"
-
+        text, icon = self._result_headline()
         text_surface = self._render_icon_text(icon, text, self.over_font, self.MENU_TEXT)
         self.screen.blit(text_surface,
                          text_surface.get_rect(centerx=self.BOARD_WIDTH // 2,
                                                centery=self.BOARD_HEIGHT // 2 - 20))
 
-        sub = self.status_font.render("R: new game   |   Z: undo   |   Esc: menu",
+        sub = self.status_font.render("R: new game   |   Z: undo   |   P: copy PGN   |   Esc: menu",
                                       True, self.MENU_LABEL)
         self.screen.blit(sub,
                          sub.get_rect(centerx=self.BOARD_WIDTH // 2,
                                       centery=self.BOARD_HEIGHT // 2 + 20))
 
-    def _draw_confirm_dialog(self, mouse_pos: tuple) -> None:
-        """Modal 'discard the current game?' prompt (Y/Enter = yes, N/Esc = no)."""
+    def _result_headline(self) -> tuple:
+        """(headline, glyph for the winner or None) describing how the game ended."""
+        result, reason = self.engine.result, self.engine.result_reason
+        if result in (RESULT_WHITE_WINS, RESULT_BLACK_WINS):
+            white_won = result == RESULT_WHITE_WINS
+            winner, loser = ("White", "Black") if white_won else ("Black", "White")
+            icon = "\u2654" if white_won else "\u265A"
+            if reason == "resignation":
+                return f"{winner} wins - {loser} resigned", icon
+            return f"{winner} wins by checkmate!", icon
+        if reason in ("stalemate", "agreement"):
+            return f"Draw by {reason}", None
+        return f"Draw - {reason}", None
+
+    def _dialog_text(self) -> tuple:
+        """(title, note, confirm label, cancel label) for the open dialog. The cancel button is
+        always the safe choice and always has the focus."""
+        if self.dialog == 'resign':
+            color = self._acting_color()
+            if self.vs_ai:
+                return ("Resign this game?", f"{get_level(self.level_key).name} will win.",
+                        "Resign (Y)", "Keep playing (N)")
+            other = 'b' if color == 'w' else 'w'
+            return (f"{self._side_name(color)} resigns?", f"{self._side_name(other)} will win.",
+                    "Resign (Y)", "Keep playing (N)")
+        if self.dialog == 'draw_offer':
+            offerer = self.engine.draw_offer_by or self._acting_color()
+            other = 'b' if offerer == 'w' else 'w'
+            return (f"{self._side_name(offerer)} offers a draw",
+                    f"{self._side_name(other)}: do you accept?", "Accept (Y)", "Decline (N)")
+        return ("Start a new game?", "The current game will be lost.", "Yes (Y)", "No (N)")
+
+    def _draw_dialog(self, mouse_pos: tuple) -> None:
+        """Modal confirmation (Y = confirm, N / Esc / Enter = the safe choice)."""
         overlay = pygame.Surface((self.BOARD_WIDTH, self.BOARD_HEIGHT), pygame.SRCALPHA)
         overlay.fill((0, 0, 0, 170))
         self.screen.blit(overlay, (0, 0))
 
-        panel = pygame.Rect(0, 0, 340, 170)
+        panel = pygame.Rect(0, 0, 400, 170)
         panel.center = (self.BOARD_WIDTH // 2, self.BOARD_HEIGHT // 2)
         pygame.draw.rect(self.screen, self.PANEL_BG, panel, border_radius=10)
         pygame.draw.rect(self.screen, self.WOOD_LIGHT, panel, 2, border_radius=10)
 
-        title = self.title_font.render("Start a new game?", True, self.PANEL_TEXT)
+        title_text, note_text, yes_label, no_label = self._dialog_text()
+        title = self.title_font.render(title_text, True, self.PANEL_TEXT)
         self.screen.blit(title, title.get_rect(centerx=panel.centerx, y=panel.y + 22))
-        note = self.status_font.render("The current game will be lost.", True, self.MENU_LABEL)
+        note = self.status_font.render(note_text, True, self.MENU_LABEL)
         self.screen.blit(note, note.get_rect(centerx=panel.centerx, y=panel.y + 58))
 
-        for bid, label in (('confirm_yes', "Yes (Y)"), ('confirm_no', "No (N)")):
+        for bid, label in (('confirm_yes', yes_label), ('confirm_no', no_label)):
             rect = self.buttons[bid]
             self._draw_gradient_button(rect, label, self.button_font,
                                        rect.collidepoint(mouse_pos), radius=8,
                                        focused=(bid == 'confirm_no'))
+
+    def _draw_toast(self) -> None:
+        """The short notice, if any: bottom centre of the board, on a dark scrim."""
+        if self.toast is None:
+            return
+        text, expires = self.toast
+        if pygame.time.get_ticks() >= expires:
+            self.toast = None
+            return
+        label = self.status_font.render(
+            self._fit_text(self.status_font, text, self.BOARD_WIDTH - 48), True, theme.TOAST_TEXT)
+        rect = label.get_rect(centerx=self.BOARD_WIDTH // 2, bottom=self.BOARD_HEIGHT - 28)
+        background = pygame.Surface(rect.inflate(28, 16).size, pygame.SRCALPHA)
+        pygame.draw.rect(background, (0, 0, 0, theme.TOAST_ALPHA), background.get_rect(), border_radius=8)
+        self.screen.blit(background, rect.inflate(28, 16))
+        self.screen.blit(label, rect)
 
     def _draw_menu(self, mouse_pos: tuple) -> None:
         """Draw the menu for the current menu state."""
@@ -1779,7 +2235,7 @@ class ChessUI:
 
         hint_text = "Up/Down: select    Enter: confirm    Esc: back"
         if self.menu_state == 'main':
-            hint_text = "Up/Down: select    Enter: confirm"
+            hint_text = "Up/Down: select    Enter: confirm    H: rules"
             if self._can_resume():
                 hint_text += "    Esc: resume game"
         hint = self.log_font.render(hint_text, True, self.MENU_SUBTLE)
@@ -1804,6 +2260,7 @@ class ChessUI:
             'resume': ("Back to board" if self.game_over else "Resume game", None),
             'vs_ai': ("Play vs Computer", None),
             'vs_human': ("2 Players", None),
+            'rules': ("Rules", None),
             'play_white': ("Play as White", "\u2654"),
             'play_black': ("Play as Black", "\u265A"),
             'back': ("Back", None),
@@ -1955,6 +2412,32 @@ def run_self_test() -> None:
     if len(game.engine.move_log) != 2:
         raise RuntimeError(f"expected 2 moves in the log, found {len(game.engine.move_log)}")
     game._draw_game_state()
+
+    # The screens added with the rules: every dialog, a notice, and a resignation's end screen.
+    for view_3d in (False, True):
+        game.view_3d = view_3d
+        for dialog in ('new_game', 'resign', 'draw_offer'):
+            game.dialog = dialog
+            game._draw_game_state()
+            game._draw_dialog((0, 0))
+        game.dialog = None
+        game._notify("self-test")
+        game._draw_toast()
+    game.view_3d = False
+    for page in range(len(RULES_PAGES)):
+        game._open_rules(page)
+        game._draw_game_state()
+        game._draw_rules((0, 0))
+        if not game._rules_layout(page)[0]:
+            raise RuntimeError(f"rules page {page + 1} is empty")
+    game._close_rules()
+    game._resign()
+    if not game.game_over or game.engine.result != RESULT_BLACK_WINS:
+        raise RuntimeError("resigning did not end the game")
+    game._draw_game_state()
+    game._draw_game_over_message()
+    if "resigned" not in game._result_headline()[0]:
+        raise RuntimeError("the end screen does not say the game ended by resignation")
     pygame.quit()
 
 

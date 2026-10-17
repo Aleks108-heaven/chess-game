@@ -84,6 +84,10 @@ FRAME_LIGHT = WOOD_500
 COORD_TEXT = WOOD_300
 COORD_OUTLINE = WOOD_950
 
+# The table the 3D board stands on (top to bottom of the window)
+TABLE_TOP = (30, 19, 11)
+TABLE_BOTTOM = (50, 31, 18)
+
 # Side panel
 PANEL_BG = GREY_900
 PANEL_TEXT = GREY_150
@@ -100,6 +104,13 @@ BUTTON_BG = BLUE_600
 BUTTON_BG_HOVER = BLUE_500
 BUTTON_BORDER = BLUE_900
 FOCUS_RING = GOLD_300
+# A control that cannot be used right now: flat and grey, but still readable.
+BUTTON_OFF_BG = GREY_800
+BUTTON_OFF_TEXT = GREY_300
+BUTTON_OFF_BORDER = GREY_700
+# A short notice drawn over the board on a black scrim of this alpha (0-255).
+TOAST_TEXT = GREY_050
+TOAST_ALPHA = 215
 
 # Level cards (the Junior -> Senior picker)
 CARD_BG = GREY_850
@@ -185,6 +196,9 @@ CONTRAST_PAIRS: List[Tuple[str, Color, Color, float]] = [
     ("focus ring on scrim", FOCUS_RING, _MENU_BACKDROP, GRAPHIC_MIN),
     ("focus ring on card", FOCUS_RING, CARD_BG, GRAPHIC_MIN),
     ("coordinate label on frame", COORD_TEXT, COORD_OUTLINE, TEXT_MIN),
+    ("disabled button label on disabled button", BUTTON_OFF_TEXT, BUTTON_OFF_BG, TEXT_MIN),
+    ("notice text over the lightest square", TOAST_TEXT, scrimmed(BOARD_LIGHT, TOAST_ALPHA), TEXT_MIN),
+    ("table backdrop vs frame", FRAME_MID, TABLE_BOTTOM, 1.5),
     ("check outline on light square", BOARD_CHECK_OUTLINE, BOARD_LIGHT, GRAPHIC_MIN),
     ("check outline on dark square", BOARD_CHECK_OUTLINE, BOARD_DARK, GRAPHIC_MIN),
     ("move dot on light square", BOARD_MOVE_DOT, BOARD_LIGHT, GRAPHIC_MIN),

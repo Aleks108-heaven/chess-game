@@ -39,9 +39,9 @@ jobs:
           pip install -r requirements-dev.txt
 
       - name: Compile check
-        run: python -m compileall -q main.py chess_engine.py chess_ai.py theme.py version.py ai tools
+        run: python -m compileall -q main.py chess_engine.py chess_ai.py rules_text.py theme.py version.py ai tools
 
-      - name: Test suite (move generator vs published perft counts, AI levels, UI, contrast)
+      - name: Test suite (rules and perft counts, AI levels, UI, rules text, installer script, contrast)
         run: python -m pytest -q
 
       - name: Headless self-test (every screen + one move against the computer)

@@ -21,7 +21,7 @@ from typing import Tuple
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from chess_ai import ChessAI, RandomAI  # noqa: E402
-from chess_engine import ChessEngine  # noqa: E402
+from chess_engine import RESULT_BLACK_WINS, RESULT_ONGOING, RESULT_WHITE_WINS, ChessEngine  # noqa: E402
 from ai.levels import LEVELS  # noqa: E402
 
 
@@ -36,17 +36,16 @@ def play_game(white_name: str, black_name: str, seed: int, max_plies: int) -> Tu
     engine = ChessEngine()
     players = {"w": make_player(white_name, seed), "b": make_player(black_name, seed + 1)}
     for ply in range(max_plies):
-        moves = engine.get_valid_moves()
-        if not moves:
-            if engine._is_in_check():
-                return (0.0 if engine.white_to_move else 1.0), ply
-            return 0.5, ply  # stalemate
         mover = "w" if engine.white_to_move else "b"
-        move = players[mover].choose_move(engine, moves)
-        engine.make_move(move)
-        if engine.is_draw():
+        engine.play(players[mover].choose_move(engine, engine.get_valid_moves()))
+        if engine.result != RESULT_ONGOING:  # mate, stalemate, or an automatic draw
+            break
+        if engine.can_claim_draw():  # both programs always claim a draw they are entitled to
             return 0.5, ply + 1
-    return 0.5, max_plies
+    else:
+        return 0.5, max_plies
+    score = {RESULT_WHITE_WINS: 1.0, RESULT_BLACK_WINS: 0.0}.get(engine.result, 0.5)
+    return score, len(engine.move_log)
 
 
 def run_match(a: str, b: str, games: int, workers: int, max_plies: int, seed: int) -> None:

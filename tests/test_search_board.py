@@ -7,7 +7,7 @@ import pytest
 from ai.board import START_FEN, InvalidPositionError, SearchBoard
 from ai.pieces import engine_piece
 from chess_engine import ChessEngine
-from tests.helpers import board_pairs, engine_from_fen, engine_pairs, play, uci_set
+from tests.helpers import engine_from_fen, engine_uci, play, uci_set
 
 # Canonical perft node counts (https://www.chessprogramming.org/Perft_Results).
 PERFT_CASES = [
@@ -41,18 +41,30 @@ def test_perft_matches_published_counts(name, fen, counts):
 
 
 def test_move_sets_match_chess_engine_on_tricky_positions():
-    """Independent cross-check: the UI's ChessEngine and SearchBoard agree move for move."""
-    tricky = [fen for name, fen, _ in PERFT_CASES[1:]] + ["8/8/8/KPp4r/8/8/8/7k w - c6 0 1"]
+    """Independent cross-check: the UI's ChessEngine and SearchBoard agree move for move,
+    promotion pieces included (a promotion is four moves in both)."""
+    tricky = [fen for name, fen, _ in PERFT_CASES[1:]] + [
+        "8/8/8/KPp4r/8/8/8/7k w - c6 0 1",
+        "4k3/8/8/8/8/8/4p3/R3K2R w KQ - 0 1",       # pawn-attacked castling squares
+        "1n5k/P7/8/8/8/8/8/K7 w - - 0 1",            # promotion by push and by capture
+    ]
     for fen in tricky:
         engine = engine_from_fen(fen)
         board = SearchBoard.from_fen(fen)
-        assert engine_pairs(engine) == board_pairs(board), fen
+        assert engine_uci(engine) == uci_set(board), fen
         for move in engine.get_valid_moves():  # one ply deeper
             engine.make_move(move)
             board.make(board.move_from_engine(move))
-            assert engine_pairs(engine) == board_pairs(board), (fen, move.get_coordinate_notation())
-            engine.undo_move()
+            assert engine_uci(engine) == uci_set(board), (fen, move.get_coordinate_notation())
+            engine._undo()
             board.unmake()
+
+
+def fen_without_en_passant(fen):
+    """The two engines write the en passant square by different conventions (the game's engine
+    only when a capture is legal); everything else must match."""
+    fields = fen.split()
+    return fields[:3] + fields[4:]
 
 
 @pytest.mark.slow
@@ -62,14 +74,52 @@ def test_random_games_stay_in_sync_with_chess_engine():
         engine, board = ChessEngine(), SearchBoard.start()
         for ply in range(90):
             moves = engine.get_valid_moves()
-            assert engine_pairs(engine) == board_pairs(board), f"game {game} ply {ply}"
+            assert engine_uci(engine) == uci_set(board), f"game {game} ply {ply}"
+            assert (fen_without_en_passant(engine.to_fen())
+                    == fen_without_en_passant(board.to_fen())), f"game {game} ply {ply}"
+            assert engine.is_insufficient_material() == board.is_insufficient_material()
             if not moves:
                 break
             move = rng.choice(moves)
-            if move.is_pawn_promotion:
-                move.promotion_piece = rng.choice("QRBN")
             engine.make_move(move)
             board.make(board.move_from_engine(move))
+
+
+def test_both_engines_agree_on_insufficient_material_for_random_minor_piece_endings():
+    """I-04 in both implementations, on many king + minor-piece positions."""
+    def placement(grid):
+        rows = []
+        for row in grid:
+            text, empty = "", 0
+            for cell in row:
+                if cell == ".":
+                    empty += 1
+                else:
+                    text += (str(empty) if empty else "") + cell
+                    empty = 0
+            rows.append(text + (str(empty) if empty else ""))
+        return "/".join(rows)
+
+    rng = random.Random(77)
+    checked = 0
+    for _ in range(400):
+        squares = rng.sample(range(64), 6)
+        white_king, black_king = squares[0], squares[1]
+        if max(abs(white_king // 8 - black_king // 8), abs(white_king % 8 - black_king % 8)) < 2:
+            continue
+        grid = [["."] * 8 for _ in range(8)]
+        grid[white_king // 8][white_king % 8], grid[black_king // 8][black_king % 8] = "K", "k"
+        for sq in squares[2:2 + rng.randint(0, 4)]:
+            grid[sq // 8][sq % 8] = rng.choice("NBnb")
+        fen = f"{placement(grid)} w - - 0 1"
+        try:
+            engine = ChessEngine.from_fen(fen)
+        except ValueError:
+            continue                                    # e.g. a king left in check
+        checked += 1
+        assert (engine.is_insufficient_material()
+                == SearchBoard.from_fen(fen).is_insufficient_material()), fen
+    assert checked > 150, f"only {checked} usable positions"
 
 
 # --- Incremental state --------------------------------------------------------------------
@@ -198,6 +248,11 @@ def test_repetition_and_fifty_move_counters():
     ("8/8/8/4k3/8/8/8/KR6 w - - 0 1", False),
     ("8/8/8/4k3/8/8/8/KQ6 w - - 0 1", False),
     ("8/8/8/4k3/8/8/8/KNN5 w - - 0 1", False),    # two knights: not automatically drawn
+    ("2b1k3/8/8/8/8/8/8/4KB2 w - - 0 1", True),   # K+B v K+B, both bishops on light squares
+    ("4k3/8/8/8/8/B7/8/2B1K3 w - - 0 1", True),   # K+B+B v K, both on dark squares
+    ("3bk3/8/8/8/8/8/8/4KB2 w - - 0 1", False),   # opposite-coloured bishops can still mate
+    ("4k3/8/8/8/8/8/8/2B1KB2 w - - 0 1", False),
+    ("4kn2/8/8/8/8/8/8/4KB2 w - - 0 1", False),   # bishop against knight
 ])
 def test_insufficient_material(fen, expected):
     assert SearchBoard.from_fen(fen).is_insufficient_material() is expected
@@ -235,6 +290,17 @@ def test_from_engine_replays_history_for_repetition_detection():
     assert len(board.keys) == 5
     assert board.is_repetition()
     assert board.to_fen().split()[:4] == SearchBoard.start().to_fen().split()[:4]
+
+
+def test_from_engine_replays_history_from_a_fen_start_too():
+    """A game set up from a FEN has history as well; the AI must see its repetitions."""
+    engine = engine_from_fen("4k3/8/8/8/8/8/8/Q3K3 w - - 0 1")
+    start_key = SearchBoard.from_engine(engine).hash
+    play(engine, "a1a4", "e8d8", "a4a1", "d8e8")
+    board = SearchBoard.from_engine(engine)
+    assert len(board.keys) == 5 and board.keys[0] == start_key
+    assert board.is_repetition(), "the position of move 0 came round again"
+    assert board.to_fen().split()[:4] == engine.to_fen().split()[:4]
 
 
 def test_from_engine_handles_a_custom_position_without_history():

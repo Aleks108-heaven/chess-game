@@ -23,14 +23,19 @@ from typing import List, Optional, Union
 from ai.board import SearchBoard
 from ai.book import OpeningBook
 from ai.levels import DEFAULT_LEVEL_KEY, LEVELS, Level, get_level
-from ai.pieces import QUEEN, letter_from_type
+from ai.pieces import QUEEN, WHITE, letter_from_type
 from ai.search import MATE_BOUND, Searcher, SearchLimits
 from chess_engine import ChessEngine, Move
 
 __all__ = ["ChessAI", "RandomAI", "SearchProgress", "LEVELS", "DEFAULT_LEVEL_KEY", "Level",
-           "get_level"]
+           "get_level", "DRAW_ACCEPT_MARGIN_CP"]
 
 BOOK_MAX_FULLMOVE = 15
+
+# The computer accepts a draw offer only when it is this many centipawns behind or worse (100 is
+# about one pawn). The same rule applies at every level.
+DRAW_ACCEPT_MARGIN_CP = 100
+_DRAW_CHECK_DEPTH, _DRAW_CHECK_SECONDS = 4, 0.25
 
 
 @dataclass(frozen=True)
@@ -78,9 +83,9 @@ class ChessAI:
         """Pick a move for the side to move, or None if there are no legal moves.
 
         ``source`` is a ChessEngine or a :meth:`snapshot`. ``valid_moves`` are the engine's
-        legal moves (required with a snapshot); the returned object is one of them, with
-        ``promotion_piece`` set when it is a promotion. Setting ``stop`` makes the search
-        return promptly with the best move found so far.
+        legal moves (required with a snapshot); the returned object is one of them (a
+        promotion is four moves, one per piece, and the search picks among them). Setting
+        ``stop`` makes the search return promptly with the best move found so far.
         """
         if isinstance(source, SearchBoard):
             board = source.copy()
@@ -95,10 +100,7 @@ class ChessAI:
 
         self.progress = SearchProgress()
         if len(valid_moves) == 1:  # a forced move needs no thought
-            only = valid_moves[0]
-            if only.is_pawn_promotion:
-                only.promotion_piece = letter_from_type(QUEEN)
-            return only
+            return valid_moves[0]
 
         level = self.level
         move = 0
@@ -107,6 +109,21 @@ class ChessAI:
         if not move:
             move = self._search(board, level, stop)
         return self._to_engine_move(move, valid_moves)
+
+    def accepts_draw(self, source: Union[ChessEngine, SearchBoard], ai_is_white: bool) -> bool:
+        """Would the computer accept a draw offered in this position (chess-rules.md, A-08)?
+
+        It says yes only when a short search finds it clearly worse (``DRAW_ACCEPT_MARGIN_CP``
+        behind), and no when it is level or ahead. Takes about a quarter of a second at most;
+        it does not disturb the level's own search state.
+        """
+        board = (source.copy() if isinstance(source, SearchBoard)
+                 else SearchBoard.from_engine(source))
+        result = Searcher({}).search(board, SearchLimits(max_depth=_DRAW_CHECK_DEPTH,
+                                                         time_limit=_DRAW_CHECK_SECONDS))
+        to_move_is_white = board.side == WHITE
+        ai_score = result.score if to_move_is_white == ai_is_white else -result.score
+        return ai_score <= -DRAW_ACCEPT_MARGIN_CP
 
     def _search(self, board: SearchBoard, level: Level,
                 stop: Optional[threading.Event]) -> int:
@@ -138,12 +155,13 @@ class ChessAI:
 
     def _to_engine_move(self, move: int, valid_moves: List[Move]) -> Move:
         frm, to = move & 63, (move >> 6) & 63
-        promo = (move >> 12) & 7
+        # A promotion is four legal moves; the one the search chose is told apart by its piece.
+        promotion = letter_from_type((move >> 12) & 7 or QUEEN)
         for candidate in valid_moves:
             if (candidate.start_row * 8 + candidate.start_col == frm
-                    and candidate.end_row * 8 + candidate.end_col == to):
-                if candidate.is_pawn_promotion:
-                    candidate.promotion_piece = letter_from_type(promo or QUEEN)
+                    and candidate.end_row * 8 + candidate.end_col == to
+                    and (not candidate.is_pawn_promotion
+                         or candidate.promotion_piece == promotion)):
                 return candidate
         # The search and the engine disagree about legality: stay playable, but keep a record.
         self.fallback_count += 1

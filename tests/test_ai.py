@@ -5,6 +5,7 @@ Priorities: H = must never break, M = important, L = nice to have.
 """
 
 import copy
+import dataclasses
 import threading
 import time
 
@@ -13,7 +14,7 @@ import pytest
 from ai.levels import DEFAULT_LEVEL_KEY, LEVELS, Level, get_level
 from chess_ai import ChessAI, RandomAI
 from chess_engine import ChessEngine
-from tests.helpers import engine_from_fen, play
+from tests.helpers import engine_from_fen, engine_move, play
 
 LEVEL_KEYS = [level.key for level in LEVELS]
 
@@ -67,13 +68,14 @@ def test_forced_move_is_returned_immediately():
     assert time.perf_counter() - start < 0.5
 
 
-def test_forced_promotion_defaults_to_a_queen():
-    # Every king move is covered, so a7-a8 is the only legal move.
+def test_a_forced_pawn_move_still_gets_a_promotion_piece():
+    # Every king move is covered, so a7-a8 is the only pawn move - but it is four legal moves
+    # (I-03), one per piece, and the computer must pick exactly one of them.
     engine = engine_from_fen("6r1/P7/8/4k3/8/8/r7/7K w - - 0 1")
     valid = engine.get_valid_moves()
-    assert [m.get_coordinate_notation() for m in valid] == ["a7a8"]
+    assert sorted(m.get_coordinate_notation() for m in valid) == ["a7a8b", "a7a8n", "a7a8q", "a7a8r"]
     move = ChessAI("senior").choose_move(engine, valid)
-    assert move.is_pawn_promotion and move.promotion_piece == "Q"
+    assert move in valid and move.is_pawn_promotion and move.promotion_piece in "QRBN"
 
 
 # AI-04 (H) Mate in one is always played ------------------------------------------------------
@@ -160,8 +162,21 @@ def test_unknown_level_is_rejected():
 def test_promotion_move_carries_a_promotion_piece():
     engine = engine_from_fen("8/P6k/8/8/8/8/8/K7 w - - 0 1")
     move = ChessAI("senior", seed=1).choose_move(engine, engine.get_valid_moves())
-    assert move.is_pawn_promotion and move.get_coordinate_notation() == "a7a8"
+    assert move.is_pawn_promotion and move.get_coordinate_notation() == "a7a8q"
     assert move.promotion_piece == "Q"
+
+
+@pytest.mark.parametrize("key", ["advanced", "senior"])
+def test_the_computer_underpromotes_to_avoid_stalemate(key):
+    """I-03: b8=Q stalemates the black king (a draw); b8=R keeps the win. The search must be
+    able to choose among the four promotions, not just take the queen."""
+    engine = engine_from_fen("8/1P6/k7/8/K7/8/8/8 w - - 0 1")
+    engine.play(engine_move(engine, "b7b8q"))
+    assert engine.result_reason == "stalemate"
+    engine.undo_move()
+    move = ChessAI(key, seed=1).choose_move(engine, engine.get_valid_moves())
+    assert move.get_coordinate_notation() == "b7b8r"
+
 
 
 # AI-12 (M) Same seed -> same decision ------------------------------------------------------------------
@@ -250,11 +265,37 @@ def test_random_baseline_is_legal():
     assert RandomAI(1).choose_move(engine_from_fen(CHECKMATED)) is None
 
 
+# AI-20 (M) A draw offer is accepted only when the computer is clearly worse ------------------------------------------------
+def test_the_computer_accepts_a_draw_only_when_it_is_clearly_worse():
+    engine = engine_from_fen("4k3/8/8/8/8/8/8/Q3K3 w - - 0 1")     # Black is a whole queen down
+    ai = ChessAI("midlevel", seed=1)
+    before = snapshot_engine(engine)
+    started = time.perf_counter()
+    assert ai.accepts_draw(engine, ai_is_white=False), "a lost position: take the draw"
+    assert not ai.accepts_draw(engine, ai_is_white=True), "the side with the queen refuses"
+    assert not ai.accepts_draw(ChessEngine(), ai_is_white=False), "equal: play on"
+    assert not ai.accepts_draw(ChessEngine(), ai_is_white=True)
+    assert time.perf_counter() - started < 4.0, "four short searches must not take seconds"
+    assert snapshot_engine(engine) == before
+
+
+def test_the_draw_offer_decision_works_from_a_snapshot_and_for_either_side_to_move():
+    black_to_move = engine_from_fen("4k3/8/8/8/8/8/8/Q3K3 b - - 0 1")
+    ai = ChessAI("junior", seed=1)
+    snapshot = ChessAI.snapshot(black_to_move)
+    assert ai.accepts_draw(snapshot, ai_is_white=False)
+    assert not ai.accepts_draw(snapshot, ai_is_white=True)
+
+
 # AI-19 (L, slow) Endgame technique: the top level converts a queen up ------------------------------------------------------
 @pytest.mark.slow
 def test_senior_mates_with_king_and_queen_against_king():
     engine = engine_from_fen("8/8/8/4k3/8/8/8/KQ6 w - - 0 1")
-    senior, defender = ChessAI("senior", seed=1), RandomAI(1)
+    # Senior's own depth, minus its wall-clock cap. With the cap, how deep each search got
+    # depended on how busy the machine was at that moment, so the game - and this test - came
+    # out differently from run to run (it failed now and then, in 1.1.0 as well).
+    senior_by_depth = dataclasses.replace(get_level("senior"), time_limit=120.0)
+    senior, defender = ChessAI(senior_by_depth, seed=1), RandomAI(1)
     for _ply in range(100):
         valid = engine.get_valid_moves()
         if not valid:
